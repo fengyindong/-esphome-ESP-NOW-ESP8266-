@@ -1,0 +1,28 @@
+substitutions:
+  device_name: espnow-mac-discovery
+  friendly_name: ESP-NOW MAC Discovery
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp8266:
+  board: nodemcuv2
+
+logger:
+  level: DEBUG
+  baud_rate: 115200
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components:
+      - espnow
+
+espnow:
+  id: espnow_bus
+  channel: 6
+  role: combo
+  auto_add_peer: false
+

@@ -1,0 +1,89 @@
+substitutions:
+  device_name: espnow-sensor-node
+  friendly_name: ESP-NOW Sensor Node
+  gateway_mac: "8C:8C:29:A3:7E:33"
+  bmp280_address: "0x77"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp8266:
+  board: nodemcuv2
+
+logger:
+  level: DEBUG
+  baud_rate: 115200
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components:
+      - espnow
+      - packet_transport
+
+i2c:
+  id: sensor_i2c
+  sda: GPIO4
+  scl: GPIO5
+  scan: true
+  frequency: 100kHz
+
+sensor:
+  - platform: aht10
+    variant: AHT20
+    i2c_id: sensor_i2c
+    address: 0x38
+    update_interval: 30s
+    temperature:
+      id: aht20_temperature
+      name: AHT20 Temperature
+      internal: true
+    humidity:
+      id: aht20_humidity
+      name: AHT20 Humidity
+      internal: true
+
+  - platform: bmp280_i2c
+    i2c_id: sensor_i2c
+    address: ${bmp280_address}
+    update_interval: 30s
+    temperature:
+      id: bmp280_temperature
+      name: BMP280 Temperature
+      internal: true
+    pressure:
+      id: bmp280_pressure
+      name: BMP280 Pressure
+      internal: true
+
+espnow:
+  id: espnow_bus
+  channel: 6
+  role: combo
+  auto_add_peer: false
+  peers:
+    - mac: ${gateway_mac}
+      id: gateway_peer
+      channel: 6
+      role: combo
+      rolling_code: false
+
+packet_transport:
+  - platform: espnow
+    id: sensor_transport
+    espnow_id: espnow_bus
+    peer_address: ${gateway_mac}
+    update_interval: 30s
+    rolling_code_enable: false
+    ping_pong_enable: false
+    sensors:
+      - id: aht20_temperature
+        broadcast_id: aht20_temperature
+      - id: aht20_humidity
+        broadcast_id: aht20_humidity
+      - id: bmp280_temperature
+        broadcast_id: bmp280_temperature
+      - id: bmp280_pressure
+        broadcast_id: bmp280_pressure

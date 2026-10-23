@@ -1,0 +1,407 @@
+#pragma once
+
+#include "esphome/core/automation.h"
+#include "esphome/core/component.h"
+#include "esphome/core/log.h"
+
+#ifdef USE_ESP8266
+
+#include <array>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <utility>
+#include <vector>
+
+#include "esphome/core/preferences.h"
+
+extern "C" {
+#include <espnow.h>
+}
+
+namespace esphome {
+namespace espnow {
+
+static const uint8_t ESPNOW_MAX_DATA_LEN = 250;
+static const uint8_t ESPNOW_MAX_TOTAL_PEER_NUM = 20;
+static const uint8_t ESPNOW_QUEUE_SIZE = 8;
+static const uint8_t ESPNOW_SEND_QUEUE_SIZE = 16;
+
+using peer_address_t = std::array<uint8_t, 6>;
+// Callback receives 0 on success, non-zero on failure (matches ESP_OK/ESP_FAIL).
+using send_callback_t = std::function<void(int)>;
+
+/// Received frame metadata.
+/// On ESP8266, only src_addr is available — the receive callback does not expose
+/// des_addr (ESP8266 non-OS SDK limitation, see design doc §2.5 and §4 divergences).
+struct ESPNowRecvInfo {
+  uint8_t src_addr[6];
+};
+
+struct ESPNowPeerConfig {
+  uint8_t mac[6];
+  uint8_t channel;
+  uint8_t role;
+  bool encrypt;
+  uint8_t lmk[16];
+  // Rolling-code anti-replay (opt-in per peer, default off).
+  // Both ends of a peer channel must agree on this setting.
+  bool rolling_code{false};
+  uint32_t tx_counter{0};      // monotonic outgoing counter, persisted in flash
+  uint32_t rx_last_seen{0};    // highest accepted incoming counter, persisted in flash
+  ESPPreferenceObject tx_pref;
+  ESPPreferenceObject rx_pref;
+};
+
+struct ESPNowQueueEntry {
+  ESPNowRecvInfo info;
+  uint8_t data[ESPNOW_MAX_DATA_LEN];
+  uint8_t size;
+};
+
+struct ESPNowSendQueueEntry {
+  peer_address_t address;
+  std::vector<uint8_t> data;
+  send_callback_t callback;
+};
+
+// ── Handler interfaces ────────────────────────────────────────────────────────
+
+class ESPNowReceivePacketHandler {
+ public:
+  virtual bool on_receive(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) = 0;
+};
+
+class ESPNowBroadcastHandler {
+ public:
+  virtual bool on_broadcast(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) = 0;
+};
+
+class ESPNowUnknownPeerHandler {
+ public:
+  virtual bool on_unknown_peer(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) = 0;
+};
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+class ESPNowComponent : public Component {
+ public:
+  void setup() override;
+  void loop() override;
+  void dump_config() override;
+  float get_setup_priority() const override { return setup_priority::LATE; }
+
+  void set_channel(uint8_t channel) { channel_ = channel; }
+  void set_self_role(uint8_t role) { self_role_ = role; }
+  void set_pmk(const std::array<uint8_t, 16> &pmk);
+  void set_auto_add_peer(bool v) { auto_add_peer_ = v; }
+
+  void add_static_peer(peer_address_t mac, uint8_t channel, uint8_t role);
+  void add_static_peer_with_lmk(peer_address_t mac, uint8_t channel, uint8_t role,
+                                std::array<uint8_t, 16> lmk);
+  void set_rolling_code(peer_address_t mac);
+
+  int add_peer(const uint8_t *mac);
+  int del_peer(const uint8_t *mac);
+  void reset_rolling_code(const uint8_t *mac);
+
+  int send(const uint8_t *peer, const std::vector<uint8_t> &data,
+           const send_callback_t &callback = nullptr) {
+    return this->send(peer, data.data(), data.size(), callback);
+  }
+  int send(const uint8_t *peer, const uint8_t *data, size_t size,
+           const send_callback_t &callback = nullptr);
+  bool is_send_pending() const { return this->send_pending_; }
+
+  void register_receive_handler(ESPNowReceivePacketHandler *h) { receive_handlers_.push_back(h); }
+  void register_broadcast_handler(ESPNowBroadcastHandler *h) { broadcast_handlers_.push_back(h); }
+  void register_unknown_peer_handler(ESPNowUnknownPeerHandler *h) { unknown_peer_handlers_.push_back(h); }
+
+ protected:
+  /// Keep the ESP8266 radio available when ESPHome's Wi-Fi network component
+  /// is disabled. This enables the STA interface without starting an AP
+  /// connection and applies the configured ESP-NOW channel.
+  bool ensure_radio_ready_();
+  bool should_manage_radio_() const;
+  uint8_t effective_peer_channel_(uint8_t configured_channel) const;
+  bool synchronize_runtime_config_();
+
+  // ESP8266 SDK callback signatures: non-const pointers, uint8_t len.
+  static void recv_cb_(uint8_t *mac, uint8_t *data, uint8_t len);
+  static void send_cb_(uint8_t *mac, uint8_t status);
+  void dispatch_(const ESPNowQueueEntry &entry);
+  void start_next_send_();
+  ESPNowPeerConfig *find_peer_(const uint8_t *mac);
+
+  uint8_t channel_{0};
+  uint8_t self_role_{ESP_NOW_ROLE_CONTROLLER};
+  bool has_pmk_{false};
+  uint8_t pmk_[16]{};
+  bool auto_add_peer_{false};
+
+  ESPNowPeerConfig static_peers_[ESPNOW_MAX_TOTAL_PEER_NUM];
+  uint8_t static_peer_count_{0};
+
+  // Single-producer (WiFi task) / single-consumer (loop) ring buffer.
+  static ESPNowQueueEntry recv_queue_[ESPNOW_QUEUE_SIZE];
+  static volatile uint8_t recv_queue_write_;
+  uint8_t recv_queue_read_{0};
+
+  // Send callback deferred to loop() — WiFi task sets the flag, loop() invokes the fn.
+  static volatile bool send_cb_fired_;
+  static volatile uint8_t send_cb_status_;
+  bool send_pending_{false};
+  bool processing_send_queue_{false};
+  send_callback_t pending_send_cb_{nullptr};
+  std::deque<ESPNowSendQueueEntry> send_queue_;
+  uint32_t last_radio_check_{0};
+
+  std::vector<ESPNowReceivePacketHandler *> receive_handlers_;
+  std::vector<ESPNowBroadcastHandler *> broadcast_handlers_;
+  std::vector<ESPNowUnknownPeerHandler *> unknown_peer_handlers_;
+};
+
+extern ESPNowComponent *global_esp_now;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+// ── Triggers ──────────────────────────────────────────────────────────────────
+
+class OnReceiveTrigger : public Trigger<const ESPNowRecvInfo &, const uint8_t *, uint8_t>,
+                         public ESPNowReceivePacketHandler {
+ public:
+  explicit OnReceiveTrigger(peer_address_t address) : has_address_(true) {
+    memcpy(address_, address.data(), 6);
+  }
+  explicit OnReceiveTrigger() {}
+
+  bool on_receive(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) override {
+    if (has_address_ && memcmp(address_, info.src_addr, 6) != 0) {
+      ESP_LOGD("espnow", "  OnReceiveTrigger: addr mismatch, skipping");
+      return false;
+    }
+    ESP_LOGD("espnow", "  OnReceiveTrigger: FIRING trigger");
+    this->trigger(info, data, size);
+    return false;
+  }
+
+ protected:
+  bool has_address_{false};
+  uint8_t address_[6]{};
+};
+
+class OnBroadcastTrigger : public Trigger<const ESPNowRecvInfo &, const uint8_t *, uint8_t>,
+                           public ESPNowBroadcastHandler {
+ public:
+  explicit OnBroadcastTrigger(peer_address_t address) : has_address_(true) {
+    memcpy(address_, address.data(), 6);
+  }
+  explicit OnBroadcastTrigger() {}
+
+  bool on_broadcast(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) override {
+    if (has_address_ && memcmp(address_, info.src_addr, 6) != 0)
+      return false;
+    this->trigger(info, data, size);
+    return false;
+  }
+
+ protected:
+  bool has_address_{false};
+  uint8_t address_[6]{};
+};
+
+class OnUnknownPeerTrigger : public Trigger<const ESPNowRecvInfo &, const uint8_t *, uint8_t>,
+                             public ESPNowUnknownPeerHandler {
+ public:
+  bool on_unknown_peer(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) override {
+    this->trigger(info, data, size);
+    return false;
+  }
+};
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+
+template<typename... Ts>
+class SendAction : public Action<Ts...>, public Parented<ESPNowComponent> {
+  TEMPLATABLE_VALUE(peer_address_t, address)
+  TEMPLATABLE_VALUE(std::vector<uint8_t>, data)
+
+ public:
+  void set_wait_for_sent(bool v) { wait_for_sent_ = v; }
+  void set_continue_on_error(bool v) { continue_on_error_ = v; }
+
+  void play_complex(const Ts &...x) override {
+    this->num_running_++;
+    auto address = this->address_.value(x...);
+    auto data = this->data_.value(x...);
+    bool wait = wait_for_sent_;
+    bool cont = continue_on_error_;
+
+    send_callback_t cb = [this, wait, cont, x...](int status) {
+      if (status == 0) {
+        if (wait)
+          this->play_next_(x...);
+      } else {
+        if (cont) {
+          if (wait)
+            this->play_next_(x...);
+        } else {
+          this->stop_complex();
+        }
+      }
+    };
+
+    int err = this->parent_->send(address.data(), data, cb);
+    if (err != 0) {
+      cb(err);
+    } else if (!wait) {
+      this->play_next_(x...);
+    }
+  }
+
+ protected:
+  void play(const Ts &...x) override {}
+
+  bool wait_for_sent_{true};
+  bool continue_on_error_{true};
+};
+
+template<typename... Ts>
+class AddPeerAction : public Action<Ts...>, public Parented<ESPNowComponent> {
+  TEMPLATABLE_VALUE(peer_address_t, address)
+
+ protected:
+  void play(const Ts &...x) override {
+    auto addr = this->address_.value(x...);
+    this->parent_->add_peer(addr.data());
+  }
+};
+
+template<typename... Ts>
+class DeletePeerAction : public Action<Ts...>, public Parented<ESPNowComponent> {
+  TEMPLATABLE_VALUE(peer_address_t, address)
+
+ protected:
+  void play(const Ts &...x) override {
+    auto addr = this->address_.value(x...);
+    this->parent_->del_peer(addr.data());
+  }
+};
+
+// Resets the RX last-seen counter for one rolling-code peer, allowing a
+// reflashed sender (whose TX counter restarted at 0) to communicate again.
+template<typename... Ts>
+class RollingCodeResetAction : public Action<Ts...>, public Parented<ESPNowComponent> {
+  TEMPLATABLE_VALUE(peer_address_t, address)
+
+ protected:
+  void play(const Ts &...x) override {
+    auto addr = this->address_.value(x...);
+    this->parent_->reset_rolling_code(addr.data());
+  }
+};
+
+}  // namespace espnow
+}  // namespace esphome
+
+// ── Declarative layer: switch sync ───────────────────────────────────────────
+
+#ifdef USE_SWITCH
+#include "esphome/components/switch/switch.h"
+
+namespace esphome {
+namespace espnow {
+
+class SwitchSyncGroup : public ESPNowReceivePacketHandler {
+ public:
+  SwitchSyncGroup(ESPNowComponent *espnow, switch_::Switch *sw) : espnow_(espnow), sw_(sw) {
+    sw->add_on_state_callback([this](bool state) {
+      uint8_t payload = state ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+      for (uint8_t i = 0; i < peer_count_; i++) {
+        espnow_->send(peers_[i], &payload, 1, nullptr);
+      }
+    });
+  }
+
+  void add_peer(peer_address_t peer) {
+    if (peer_count_ < ESPNOW_MAX_TOTAL_PEER_NUM) {
+      memcpy(peers_[peer_count_++], peer.data(), 6);
+    }
+  }
+
+  bool on_receive(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) override {
+    for (uint8_t i = 0; i < peer_count_; i++) {
+      if (memcmp(info.src_addr, peers_[i], 6) == 0) {
+        if (size >= 1) {
+          if (data[0] != 0) sw_->turn_on();
+          else sw_->turn_off();
+        }
+        return false;
+      }
+    }
+    return false;
+  }
+
+ protected:
+  ESPNowComponent *espnow_;
+  switch_::Switch *sw_;
+  uint8_t peers_[ESPNOW_MAX_TOTAL_PEER_NUM][6]{};
+  uint8_t peer_count_{0};
+};
+
+}  // namespace espnow
+}  // namespace esphome
+#endif  // USE_SWITCH
+
+// ── Declarative layer: sensor publish / receive ───────────────────────────────
+
+#ifdef USE_SENSOR
+#include "esphome/components/sensor/sensor.h"
+
+namespace esphome {
+namespace espnow {
+
+class ESPNowSensor : public sensor::Sensor, public ESPNowReceivePacketHandler {
+ public:
+  ESPNowSensor(ESPNowComponent *espnow, peer_address_t source) {
+    memcpy(source_, source.data(), 6);
+    espnow->register_receive_handler(this);
+  }
+
+  bool on_receive(const ESPNowRecvInfo &info, const uint8_t *data, uint8_t size) override {
+    if (memcmp(info.src_addr, source_, 6) != 0)
+      return false;
+    if (size != sizeof(float))
+      return false;
+    float value;
+    memcpy(&value, data, sizeof(float));
+    this->publish_state(value);
+    return false;
+  }
+
+ protected:
+  uint8_t source_[6]{};
+};
+
+class SensorPublishHandler {
+ public:
+  SensorPublishHandler(ESPNowComponent *espnow, peer_address_t peer) : espnow_(espnow) {
+    memcpy(peer_, peer.data(), 6);
+  }
+
+  void register_with(sensor::Sensor *sensor) {
+    sensor->add_on_state_callback([this](float value) {
+      uint8_t buf[sizeof(float)];
+      memcpy(buf, &value, sizeof(float));
+      espnow_->send(peer_, buf, sizeof(float), nullptr);
+    });
+  }
+
+ protected:
+  ESPNowComponent *espnow_;
+  uint8_t peer_[6]{};
+};
+
+}  // namespace espnow
+}  // namespace esphome
+#endif  // USE_SENSOR
+
+#endif  // USE_ESP8266
